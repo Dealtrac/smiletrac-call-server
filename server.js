@@ -2,7 +2,6 @@ const express = require('express');
 const twilio = require('twilio');
 const app = express();
 
-// CORS — allow requests from any origin
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -14,29 +13,33 @@ app.use((req, res, next) => {
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-const callJobs = {};
+// Call queue — holds calls until scheduled time
+const callQueue = [];
+const callResults = {};
+let schedulerRunning = false;
 
-// Health check — open in browser to confirm server is running
+// Health check
 app.get('/', (req, res) => {
   res.json({
     status: 'SmileTrac AI Call Server running ✓',
-    version: '3.0',
-    time: new Date().toISOString(),
+    version: '4.0',
+    queued: callQueue.length,
+    time: new Date().toLocaleTimeString('en-US', {timeZone: 'America/Indiana/Indianapolis'}),
+    timezone: 'America/Indiana/Indianapolis'
   });
 });
 
-// Ping — used by app to test connection
+// Ping
 app.get('/ping', (req, res) => {
   res.json({ ok: true, message: 'SmileTrac server reachable' });
 });
 
-// Receive call job from scraper
+// Queue a call — fires at scheduled time (default 8pm Indianapolis time)
 app.post('/call-test', async (req, res) => {
-  const { to, sid, token, from, leadId } = req.body;
+  const { to, sid, token, from, leadId, scheduleTime } = req.body;
 
-  // Return success for connection test (no Twilio creds needed)
   if (!sid || !token) {
-    return res.json({ success: true, test: true, message: 'Connection OK' });
+    return res.json({ success: true, test: true, message: 'Connection OK — no credentials provided' });
   }
   if (!to || !from) {
     return res.status(400).json({ error: 'Missing: to, from' });
@@ -45,59 +48,148 @@ app.post('/call-test', async (req, res) => {
   const digits = to.replace(/\D/g, '');
   const e164 = digits.length === 10 ? '+1' + digits : '+' + digits;
 
-  try {
-    const client = twilio(sid, token);
-    const serverUrl = process.env.SERVER_URL || `https://${req.headers.host}`;
-
-    const call = await client.calls.create({
-      to: e164,
-      from: from,
-      twiml: '<Response><Pause length="30"/></Response>',
-      machineDetection: 'DetectMessageEnd',
-      asyncAmd: true,
-      asyncAmdStatusCallback: `${serverUrl}/call-result`,
-      asyncAmdStatusCallbackMethod: 'POST',
-    });
-
-    callJobs[call.sid] = {
-      leadId,
-      phone: e164,
-      startTime: new Date().toISOString()
-    };
-
-    console.log(`✓ Call queued: ${e164} | Lead: ${leadId} | Sid: ${call.sid}`);
-    res.json({ success: true, callSid: call.sid, to: e164 });
-
-  } catch (err) {
-    console.error('Twilio error:', err.message);
-    res.status(500).json({ error: err.message });
+  // Calculate when to fire this call
+  const now = new Date();
+  const indy = new Date(now.toLocaleString('en-US', {timeZone: 'America/Indiana/Indianapolis'}));
+  
+  // Default: next 8pm Indianapolis time
+  let fireAt = new Date(indy);
+  fireAt.setHours(20, 0, 0, 0); // 8:00pm
+  
+  // If already past 8pm today, schedule for tomorrow
+  if (indy >= fireAt) {
+    fireAt.setDate(fireAt.getDate() + 1);
   }
+
+  // Allow custom time override (format: "HH:MM" in 24hr)
+  if (scheduleTime && /^\d{2}:\d{2}$/.test(scheduleTime)) {
+    const [h, m] = scheduleTime.split(':').map(Number);
+    fireAt = new Date(indy);
+    fireAt.setHours(h, m, 0, 0);
+    if (indy >= fireAt) fireAt.setDate(fireAt.getDate() + 1);
+  }
+
+  const job = {
+    id: Date.now() + '-' + Math.random().toString(36).slice(2,6),
+    to: e164,
+    from,
+    sid,
+    token,
+    leadId: leadId || 'unknown',
+    fireAt: fireAt.toISOString(),
+    fireAtLocal: fireAt.toLocaleString('en-US', {timeZone: 'America/Indiana/Indianapolis'}),
+    status: 'queued',
+    queuedAt: new Date().toISOString()
+  };
+
+  callQueue.push(job);
+  console.log(`✓ Queued: ${e164} | Lead: ${leadId} | Fire at: ${job.fireAtLocal}`);
+  
+  // Start scheduler if not running
+  if (!schedulerRunning) startScheduler();
+
+  res.json({ 
+    success: true, 
+    jobId: job.id,
+    to: e164,
+    scheduledFor: job.fireAtLocal,
+    queueLength: callQueue.length
+  });
 });
 
-// Twilio calls this when call completes
+// Scheduler — checks every minute for calls ready to fire
+function startScheduler() {
+  schedulerRunning = true;
+  console.log('Scheduler started');
+  
+  setInterval(async () => {
+    const now = new Date();
+    const indyNow = new Date(now.toLocaleString('en-US', {timeZone: 'America/Indiana/Indianapolis'}));
+    
+    const ready = callQueue.filter(j => j.status === 'queued' && new Date(j.fireAt) <= indyNow);
+    
+    for (const job of ready) {
+      job.status = 'calling';
+      console.log(`Firing call: ${job.to} | Lead: ${job.leadId}`);
+      
+      try {
+        const client = twilio(job.sid, job.token);
+        const serverUrl = process.env.SERVER_URL || 'https://smiletrac-call-server-production.up.railway.app';
+        
+        const call = await client.calls.create({
+          to: job.to,
+          from: job.from,
+          twiml: '<Response><Pause length="30"/></Response>',
+          machineDetection: 'DetectMessageEnd',
+          asyncAmd: true,
+          asyncAmdStatusCallback: `${serverUrl}/call-result`,
+          asyncAmdStatusCallbackMethod: 'POST',
+        });
+        
+        job.status = 'called';
+        job.callSid = call.sid;
+        callResults[call.sid] = { leadId: job.leadId, phone: job.to, jobId: job.id };
+        console.log(`✓ Called: ${job.to} | SID: ${call.sid}`);
+        
+      } catch (err) {
+        job.status = 'failed';
+        job.error = err.message;
+        console.error(`✗ Failed: ${job.to} | ${err.message}`);
+      }
+    }
+  }, 60000); // Check every 60 seconds
+}
+
+// Twilio callback when call completes
 app.post('/call-result', (req, res) => {
   const { CallSid, AnsweredBy, To } = req.body;
-  const job = callJobs[CallSid];
-  const isVM = AnsweredBy && AnsweredBy.startsWith('machine');
-  const isAnswered = AnsweredBy === 'human';
-  const result = isVM ? 'VOICEMAIL' : isAnswered ? 'ANSWERED' : 'UNKNOWN';
-  console.log(`Call result: ${To} → ${result} (${AnsweredBy}) | Lead: ${job?.leadId}`);
-  if (job) delete callJobs[CallSid];
+  const job = callResults[CallSid];
+  const isVM = AnsweredBy && (AnsweredBy.startsWith('machine') || AnsweredBy === 'fax');
+  const isHuman = AnsweredBy === 'human';
+  const result = isVM ? 'VOICEMAIL' : isHuman ? 'ANSWERED' : 'UNKNOWN';
+  
+  console.log(`Result: ${To} → ${result} (${AnsweredBy}) | Lead: ${job?.leadId}`);
+  
+  // Find and update job
+  const qJob = callQueue.find(j => j.callSid === CallSid);
+  if (qJob) {
+    qJob.vmResult = result;
+    qJob.answeredBy = AnsweredBy;
+  }
+  
   res.sendStatus(200);
 });
 
-// See pending calls
+// Status — see queue
 app.get('/status', (req, res) => {
+  const indyTime = new Date().toLocaleString('en-US', {timeZone: 'America/Indiana/Indianapolis'});
   res.json({
-    pendingCalls: Object.keys(callJobs).length,
-    calls: Object.entries(callJobs).map(([sid, job]) => ({
-      callSid: sid,
-      leadId: job.leadId,
-      phone: job.phone,
-      startTime: job.startTime
+    currentTime: indyTime,
+    timezone: 'Indianapolis (Eastern)',
+    queuedCalls: callQueue.filter(j => j.status === 'queued').length,
+    calledToday: callQueue.filter(j => j.status === 'called').length,
+    failedToday: callQueue.filter(j => j.status === 'failed').length,
+    recentCalls: callQueue.slice(-10).map(j => ({
+      lead: j.leadId,
+      phone: j.to,
+      status: j.status,
+      scheduledFor: j.fireAtLocal,
+      vmResult: j.vmResult || 'pending',
+      error: j.error
     }))
   });
 });
 
+// Clear queue (for testing)
+app.post('/clear', (req, res) => {
+  const cleared = callQueue.length;
+  callQueue.length = 0;
+  res.json({ cleared, message: 'Queue cleared' });
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`SmileTrac AI Call Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`SmileTrac AI Call Server v4.0 running on port ${PORT}`);
+  console.log(`Timezone: America/Indiana/Indianapolis`);
+  startScheduler();
+});
