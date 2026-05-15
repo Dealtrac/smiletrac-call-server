@@ -1,7 +1,7 @@
 {
   "name": "smiletrac-call-server",
-  "version": "3.0.0",
-  "description": "SmileTrac AI — After-Hours Call Test Server",
+  "version": "4.0.0",
+  "description": "SmileTrac AI — After-Hours Call Test Server with 8pm Scheduler",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
