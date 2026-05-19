@@ -1,14 +1,15 @@
 {
   "name": "smiletrac-call-server",
-  "version": "4.0.0",
-  "description": "SmileTrac AI — After-Hours Call Test Server with 8pm Scheduler",
+  "version": "2.0.0",
+  "description": "SmileTrac AI - Twilio VM Detection Backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "twilio": "^4.19.0"
+    "twilio": "^4.19.0",
+    "cors": "^2.8.5"
   },
   "engines": {
     "node": ">=18.0.0"
