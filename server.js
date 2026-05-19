@@ -21,6 +21,16 @@ app.get('/status', (req, res) => {
     time: new Date().toISOString()
   });
 });
+// ── Ping (alias for status) ───────────────────────────
+app.get('/ping', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'SmileTrac AI - VM Detection Server',
+    queued: callQueue.length,
+    results: Object.keys(callResults).length,
+    time: new Date().toISOString()
+  });
+});
 
 // ── Queue a call ──────────────────────────────────────
 app.post('/queue', (req, res) => {
